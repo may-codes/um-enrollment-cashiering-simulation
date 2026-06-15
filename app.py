@@ -130,15 +130,18 @@ DAY_DURATION = int((dt_end - dt_start).total_seconds() / 60)
 st.sidebar.info(f"Total calculated operational window: {DAY_DURATION} minutes ({DAY_DURATION/60:.1f} hours)")
 
 # Initialize or update random daily volumes in session state based on transaction time
+# Model: ~65-72% of daily cap are early birds (arrive before 8 AM) ≈ 900-1100 students.
+# During-hours (8 AM onwards) adds 400-600 more at 1/min before ticket window cuts off.
+# Total cap per day: 1400-1700 — well under 2000, matching real UM ticket cutoff practice.
 scale = DAY_DURATION / 540.0
 if "random_daily_students" not in st.session_state or st.session_state.get("prev_duration") != DAY_DURATION:
     sys_rand = random.SystemRandom()
     st.session_state.random_daily_students = {
-        1: int(sys_rand.randint(800, 1100) * scale),
-        2: int(sys_rand.randint(900, 1200) * scale),
-        3: int(sys_rand.randint(1300, 1700) * scale),
-        4: int(sys_rand.randint(1600, 2000) * scale),
-        5: int(sys_rand.randint(2000, 2500) * scale)
+        1: int(sys_rand.randint(1400, 1500) * scale),   # Day 1: ~910-1080 early birds + 490-420 during hours
+        2: int(sys_rand.randint(1450, 1550) * scale),   # Day 2: ~940-1116 early birds + 510-434 during hours
+        3: int(sys_rand.randint(1500, 1600) * scale),   # Day 3: ~975-1152 early birds + 525-448 during hours
+        4: int(sys_rand.randint(1550, 1650) * scale),   # Day 4: ~1008-1188 early birds + 542-462 during hours
+        5: int(sys_rand.randint(1600, 1700) * scale),   # Day 5: ~1040-1224 early birds + 560-476 during hours
     }
     st.session_state.prev_duration = DAY_DURATION
 
@@ -226,6 +229,7 @@ new_mu = np.log(new_mean) - (new_sigma ** 2) / 2.0
 
 wait_times = []
 service_times = []
+students_arrived = 0
 students_served = 0
 students_balked = 0
 queue_lengths = []
@@ -248,34 +252,36 @@ class CashieringSystem:
         service_times.append(service_time)
         yield self.env.timeout(service_time)
 
-def student_process(env, name, system, student_type, is_early=False):
-    global wait_times, students_served, students_balked, queue_lengths
+def student_process(env, name, system, student_type, arrival_time=None):
+    """
+    Models a single student's journey through the cashiering system.
+    - Pre-queue students (arrival_time=0): arrived before 8 AM at 1/min intervals.
+      They sleep until t=0 (office opening) before joining the cashier queue.
+    - During-hours students (arrival_time=None): arrive after 8 AM, record time then
+      take a short slip-machine delay before queuing.
+    """
+    global wait_times, students_arrived, students_served, students_balked, queue_lengths
+    students_arrived += 1
 
-    if is_early:
-        # Arrived early before office hours (5 to 30 minutes before opening)
-        arrival_time = -random.uniform(5, 30)
-        # Give a small dispenser/processing queue entry delay at opening (between 0.1 and 1.0 minute)
-        yield env.timeout(random.uniform(0.1, 1.0))
-    else:
+    if arrival_time is None:
+        # Student arriving during office hours — record when they join
         arrival_time = env.now
-        # Pre-Queue Dispenser Delays
-        if student_type == "new":
-            queue_machine_delay = random.uniform(3, 5)
-        else:
-            queue_machine_delay = random.uniform(0.2, 1)
-        yield env.timeout(queue_machine_delay)
+        # Short queue number slip machine delay
+        yield env.timeout(random.uniform(0.5, 1.0))
+    else:
+        # Pre-queue student: wait until the office opens at t=0 if not there yet
+        if env.now < 0:
+            yield env.timeout(-env.now)  # sleep exactly until 8 AM
 
     current_queue = len(system.cashier.queue)
     queue_lengths.append(current_queue)
 
-    # Lessen Balking System - capped at 0.10
-    if current_queue > 30:
-        balk_probability = min(0.10, (current_queue / 200))
-        if random.random() < balk_probability:
-            students_balked += 1
-            return
+    # Rare balking: ~1% of students give up and throw away their ticket
+    if random.random() < 0.01:
+        students_balked += 1
+        return
 
-    # Enter Queue and await window resource assignment
+    # Enter main queue and wait for an available cashier window
     with system.cashier.request() as request:
         yield request
         wait = env.now - arrival_time
@@ -283,67 +289,78 @@ def student_process(env, name, system, student_type, is_early=False):
         yield env.process(system.process_payment(student_type))
         students_served += 1
 
-def arrival_generator(env, system, total_students, official_cutoff, early_arrivals_enabled):
+def arrival_generator(env, system, total_students, official_cutoff, early_arrivals_enabled, pre_queue_count):
+    """
+    Simulates the real UM cashiering arrival pattern:
+      Phase 1 — Pre-opening (t < 0): students arrive 1-per-minute before 8 AM.
+                 Each student sleeps until t=0 before joining the cashier queue.
+                 The env clock starts at -pre_queue_count so there are exactly enough
+                 minutes for all early birds to arrive before the office opens.
+      Phase 2 — During hours (t=0 to official_cutoff): 1 student per minute continues
+                 arriving until the ticket cap (total_students) is hit.
+      After cap: ticket window closed; env.run() finishes all remaining service (overtime).
+    """
     student_id = 0
-    
-    # Process early arrivals at the start of the day
-    if early_arrivals_enabled:
-        early_ratio = random.uniform(0.05, 0.12)
-        early_count = int(total_students * early_ratio)
-        for _ in range(early_count):
-            if student_id >= total_students:
-                break
+
+    # Phase 1: Pre-opening arrivals — 1 student per minute leading up to 8 AM
+    if early_arrivals_enabled and pre_queue_count > 0:
+        for i in range(pre_queue_count):
+            yield env.timeout(1.0)  # 1-minute interarrival (same as during-hours)
             student_type = random.choices(["old", "new"], weights=[old_student_percent, new_student_percent])[0]
-            env.process(student_process(env, f"Student-Early-{student_id}", system, student_type, is_early=True))
+            # arrival_time=0: wait is measured from 8 AM (office opening), not from physical arrival
+            env.process(student_process(env, f"PreQueue-{student_id}", system, student_type, arrival_time=0))
             student_id += 1
-            
+        # env.now is now exactly 0 (8 AM) — all early birds have arrived and are sleeping until t=0
+
+    # Phase 2: During-hours arrivals — exactly 1 student per minute until ticket cap
     while env.now < official_cutoff and student_id < total_students:
-        current_time = env.now
-
-        # Peak Multi-Interval Surge Metrics
-        if current_time < 180:
-            interarrival = random.expovariate(1 / 0.20)
-        elif 180 <= current_time <= 360:
-            interarrival = random.expovariate(1 / 0.40)
-        else:
-            interarrival = random.expovariate(1 / 0.25)
-
-        yield env.timeout(interarrival)
-
+        yield env.timeout(1.0)  # fixed 1-minute interarrival
         student_type = random.choices(["old", "new"], weights=[old_student_percent, new_student_percent])[0]
-        env.process(student_process(env, f"Student-{student_id}", system, student_type, is_early=False))
+        env.process(student_process(env, f"Student-{student_id}", system, student_type))
         student_id += 1
+    # After loop exits: ticket window is closed, but env.run() continues until all queued students are served
+
 
 def run_simulation(window_count, early_arrivals_enabled):
     daily_results = []
     
     for day, total_students in daily_students.items():
-        global wait_times, service_times, students_served, students_balked, queue_lengths
+        global wait_times, service_times, students_arrived, students_served, students_balked, queue_lengths
         
         # Reset storage matrices per day execution
         wait_times, service_times, queue_lengths = [], [], []
-        students_served, students_balked = 0, 0
-        
-        env = simpy.Environment()
+        students_arrived, students_served, students_balked = 0, 0, 0
+
+        # Determine how many students arrive BEFORE 8 AM (early birds, 1/min)
+        # The env clock will start exactly -pre_queue_count minutes before 8 AM
+        if early_arrivals_enabled:
+            pre_queue_ratio = random.uniform(0.65, 0.72)
+            pre_queue_count = min(int(total_students * pre_queue_ratio), total_students)
+        else:
+            pre_queue_count = 0
+
+        # Start simulation clock at -(pre_queue_count) so early birds arrive 1/min up to t=0
+        env = simpy.Environment(initial_time=-pre_queue_count)
         system = CashieringSystem(env, window_count)
         
-        env.process(arrival_generator(env, system, total_students, DAY_DURATION, early_arrivals_enabled))
-        env.run() 
+        env.process(arrival_generator(env, system, total_students, DAY_DURATION, early_arrivals_enabled, pre_queue_count))
+        env.run()
         
-        end_time = env.now
+        end_time = env.now  # positive: minutes after 8 AM when last student was served
         overtime_minutes = max(0.0, end_time - DAY_DURATION)
         
         avg_wait = float(statistics.mean(wait_times)) if wait_times else 0.0
         max_wait = float(max(wait_times)) if wait_times else 0.0
         
         total_service = sum(service_times)
-        total_available = window_count * end_time
-        utilization = (total_service / total_available) * 100 if total_available > 0 else 0.0
+        # Cashier works from t=0 (office open) to t=end_time — don't count pre-opening time
+        cashier_available_minutes = window_count * max(end_time, 0)
+        utilization = (total_service / cashier_available_minutes) * 100 if cashier_available_minutes > 0 else 0.0
         avg_service = float(statistics.mean(service_times)) if service_times else 0.0
         
         daily_results.append({
             "day": day,
-            "incoming": total_students,
+            "incoming": students_arrived,  # actual arrivals counted during simulation
             "served": students_served,
             "balked": students_balked,
             "avg_wait": avg_wait,
@@ -555,6 +572,12 @@ with tab2:
 
 with tab3:
     st.subheader("System Modeling Output Matrices")
+    st.info(
+        "**⏱ Waiting Time Methodology:** Waiting time is measured from **8:00 AM (office opening)**, "
+        "not from when students physically arrived. Students who came early (pre-queue) are counted in "
+        "Total Arrivals, but their wait clock starts when the cashier windows open — reflecting what "
+        "the office can control, not individual student choices about when to arrive."
+    )
     
     selected_win_view = st.selectbox(
         "Filter Data View by Window Count:", sorted(window_analysis.keys()),
@@ -572,11 +595,11 @@ with tab3:
     st.dataframe(
         df_filtered.rename(columns={
             "day": "Enrollment Day",
-            "incoming": "Total Arrivals",
+            "incoming": "Total Arrivals (incl. pre-queue)",
             "served": "Students Processed",
             "balked": "Students Balked",
-            "avg_wait": "Avg Wait (Mins)",
-            "max_wait": "Max Wait (Mins)",
+            "avg_wait": "Avg Wait from 8 AM (Mins)",
+            "max_wait": "Max Wait from 8 AM (Mins)",
             "utilization": "Cashier Utilization %",
             "overtime_hours": "Overtime Hours Required",
             "max_queue": "Max Queue Length Peak",
