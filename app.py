@@ -276,8 +276,8 @@ def student_process(env, name, system, student_type, arrival_time=None):
     current_queue = len(system.cashier.queue)
     queue_lengths.append(current_queue)
 
-    # Rare balking: ~1% of students give up and throw away their ticket
-    if random.random() < 0.01:
+    # Rare balking: ~5% of students give up and throw away their ticket
+    if random.random() < 0.05:
         students_balked += 1
         return
 
